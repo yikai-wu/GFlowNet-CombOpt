@@ -39,8 +39,8 @@ class DetailedBalance(object):
         gin_dict = {"hidden_dim": cfg.hidden_dim, "num_layers": cfg.hidden_layer,
                     "dropout": cfg.dropout, "learn_eps": cfg.learn_eps,
                     "aggregator_type": cfg.aggr}
-        self.model = GIN(3, 1, graph_level_output=0, **gin_dict).to(device)
-        self.model_flow = GIN(3, 0, graph_level_output=1, **gin_dict).to(device)
+        self.model = GIN(8, 1, graph_level_output=0, **gin_dict).to(device)
+        self.model_flow = GIN(8, 0, graph_level_output=1, **gin_dict).to(device)
         self.params = [
             {"params": self.model.parameters(), "lr": cfg.lr},
             {"params": self.model_flow.parameters(), "lr": cfg.zlr},

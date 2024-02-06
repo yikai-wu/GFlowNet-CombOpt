@@ -45,8 +45,8 @@ def ema_update(model, ema_model, alpha=0.999):
 def get_decided(state, task="MaxIndependentSet") -> torch.bool:
     # assert isinstance(state, torch.LongTensor) or isinstance(state, torch.cuda.LongTensor) # cannot be used in jit
     assert state.dtype == torch.long
-    if task in ["MaxIndependentSet", "MinDominateSet", "MaxClique", "MaxCut"]:
-        return state != 2
+    if task in ["MaxIndependentSet", "MinDominateSet", "MaxClique", "MaxCut", "Coloring", "ThreeColoring"]:
+        return state != 0
     else:
         raise NotImplementedError
 
@@ -57,9 +57,45 @@ def get_parent(state, task="MaxIndependentSet") -> torch.bool:
     if task in ["MaxIndependentSet", "MaxClique", "MaxCut"]:
         return state == 1
     elif task in ["MinDominateSet"]:
-        return state == 0
+        return state == 2
+    elif task in ["Coloring", "ThreeColoring"]:
+        return state >= 1
     else:
         raise NotImplementedError
+    
+def min_unique(device):
+    def my_func(nodes):
+        unique_lst = torch.unique(nodes.mailbox['m'], dim=1)
+        n = unique_lst.shape[0]
+        possible_color = torch.zeros(n).to(device)
+        for i in range(0, n):
+            possible_color[i] = 1
+            for c in unique_lst[i]:
+                if possible_color[i] == c:
+                    possible_color[i] += 1
+                elif c != 0 or possible_color[i] >= 127:
+                    break
+        return {'h': possible_color}
+    
+    return my_func
+
+def min_unique_three(device):
+    def my_func_2(nodes):
+        unique_lst = torch.unique(nodes.mailbox['m'], dim=1)
+        n = unique_lst.shape[0]
+        possible_color = torch.zeros(n).to(device)
+        for i in range(0, n):
+            possible_color[i] = 1
+            for c in unique_lst[i]:
+                if c >= 4:
+                    possible_color[i] = 4
+                    break
+                if possible_color[i] == c:
+                    possible_color[i] += 1
+                elif (c != 0) or (possible_color[i] >= 4):
+                    break
+        return {'h': possible_color}
+    return my_func_2
 
 
 class GraphCombOptMDP(object):
@@ -72,7 +108,7 @@ class GraphCombOptMDP(object):
         self.numnode_per_graph = gbatch.batch_num_nodes().tolist()
         cum_num_node = gbatch.batch_num_nodes().cumsum(dim=0)
         self.cum_num_node = torch.cat([torch.tensor([0]).to(cum_num_node), cum_num_node])[:-1]
-        self._state = torch.full((gbatch.num_nodes(),), 2, dtype=torch.long, device=self.device)
+        self._state = torch.full((gbatch.num_nodes(),), 0, dtype=torch.long, device=self.device)
         self.done = torch.full((self.batch_size,), False, dtype=torch.bool, device=self.device)
 
     @property
@@ -104,12 +140,16 @@ def get_mdp_class(task):
         return MinDominateSetMDP
     elif task == "MaxCut":
         return MaxCutMDP
+    elif task == "Coloring":
+        return ColoringMDP
+    elif task == "ThreeColoring":
+        return ThreeColoringMDP
     else:
         raise NotImplementedError
 
 class MaxIndSetMDP(GraphCombOptMDP):
     # MDP conditioned on a batch of graphs
-    # state: 0: not selected, 1: selected, 2: undecided
+    # state: 2: not selected, 1: selected, 0: undecided
     def __init__(self, gbatch, cfg):
         assert cfg.task == "MaxIndependentSet"
         super(MaxIndSetMDP, self).__init__(gbatch, cfg)
@@ -130,7 +170,7 @@ class MaxIndSetMDP(GraphCombOptMDP):
             self.gbatch.update_all(fn.copy_u("h", "m"), fn.sum("m", "h"))
             x1_deg = self.gbatch.ndata.pop('h')  # (#node, # of 1-labeled neighbour node)
         undecided = ~get_decided(state)
-        state[undecided & (x1_deg > 0)] = 0
+        state[undecided & (x1_deg > 0)] = 2
         self._state = state
 
         decided_tensor = pad_batch(self.get_decided_mask(state), self.numnode_per_graph, padding_value=True)
@@ -147,8 +187,8 @@ class MaxIndSetMDP(GraphCombOptMDP):
         return [(s == 1).sum().item() for s in state_per_graph]
 
 class MaxCliqueMDP(GraphCombOptMDP):
-    # initial state: all nodes = "2" (all nodes are undecided)
-    # 1: selected, 0: not selected, 2: undecided
+    # initial state: all nodes = "0" (all nodes are undecided)
+    # 1: selected, 2: not selected, 0: undecided
     def __init__(self, gbatch, cfg,):
         super(MaxCliqueMDP, self).__init__(gbatch, cfg)
 
@@ -161,7 +201,7 @@ class MaxCliqueMDP(GraphCombOptMDP):
         state[action_node_idx] = 1
 
         # calculate num of "1" for each grpah
-        num1 = pad_batch(state == 1, self.numnode_per_graph, padding_value=0).sum(dim=1)
+        num1 = pad_batch(state == 1, self.numnode_per_graph, padding_value=2).sum(dim=1)
         num1 = [num * torch.ones(count).to(self.device) for count, num in zip(self.numnode_per_graph, num1)]
         num1 = torch.cat(num1) # same shape with state
         # if a node is not connected to all "1" nodes, label it to be "0"
@@ -170,7 +210,7 @@ class MaxCliqueMDP(GraphCombOptMDP):
             self.gbatch.update_all(fn.copy_u("h", "m"), fn.sum("m", "h"))
             x1_deg = self.gbatch.ndata.pop('h')
         undecided = ~get_decided(state)
-        state[undecided & (x1_deg < num1)] = 0
+        state[undecided & (x1_deg < num1)] = 2
         self._state = state
 
         decided_tensor = pad_batch(self.get_decided_mask(state), self.numnode_per_graph, padding_value=True)
@@ -178,7 +218,7 @@ class MaxCliqueMDP(GraphCombOptMDP):
         return state
 
     def get_log_reward(self):
-        state = pad_batch(self._state, self.numnode_per_graph, padding_value=2)
+        state = pad_batch(self._state, self.numnode_per_graph, padding_value=0)
         sol = (state == 1).sum(dim=1).float()
         return sol
 
@@ -187,9 +227,9 @@ class MaxCliqueMDP(GraphCombOptMDP):
         return [(s == 1).sum().item() for s in state_per_graph]
 
 class MinDominateSetMDP(GraphCombOptMDP):
-    # initial state: all nodes = "2" (all nodes are in the set)
-    # 0: already deleted from the set, 1: in set, can't be deleted from the set,
-    # 2: in set, might be deleted from the set in future steps
+    # initial state: all nodes = "0" (all nodes are in the set)
+    # 2: already deleted from the set, 1: in set, can't be deleted from the set,
+    # 0: in set, might be deleted from the set in future steps
     def __init__(self, gbatch, cfg):
         super(MinDominateSetMDP, self).__init__(gbatch, cfg)
         assert not cfg.back_trajectory
@@ -201,18 +241,18 @@ class MinDominateSetMDP(GraphCombOptMDP):
         action_node_idx = (self.cum_num_node + action)[~self.done]
         # assert torch.all(state[action_node_idx] == 2)
         assert torch.all(~self.get_decided_mask(state[action_node_idx]))
-        state[action_node_idx] = 0
+        state[action_node_idx] = 2
 
         undecided = ~get_decided(state)
         with self.gbatch.local_scope():
-            self.gbatch.ndata["h"] = ((state == 1) | (state == 2)).float()
+            self.gbatch.ndata["h"] = ((state == 1) | (state == 0)).float()
             self.gbatch.update_all(fn.copy_u("h", "m"), fn.sum("m", "h"))
             x12_deg = self.gbatch.ndata.pop('h').int()
         # or if a "2" has no neighbour in the set, it must stay in the set, too
         state[undecided & (x12_deg == 0)] = 1
 
         # this kinds of special "0" needs to have a neighbour stay in the set
-        special0 = (state == 0) & (x12_deg <= 1)
+        special0 = (state == 2) & (x12_deg <= 1)
         with self.gbatch.local_scope():
             self.gbatch.ndata["h"] = special0.float()
             self.gbatch.update_all(fn.copy_u("h", "m"), fn.sum("m", "h"))
@@ -228,7 +268,7 @@ class MinDominateSetMDP(GraphCombOptMDP):
         return state
 
     def get_log_reward(self):
-        state = pad_batch(self._state, self.numnode_per_graph, padding_value=2)
+        state = pad_batch(self._state, self.numnode_per_graph, padding_value=0)
         sol = - (state == 1).sum(dim=1).float() # todo
         # sol = (state == 0).sum(dim=1).float()
         return sol
@@ -241,10 +281,10 @@ class MinDominateSetMDP(GraphCombOptMDP):
         return [-(s == 1).sum().item() for s in state_per_graph]
 
 class MaxCutMDP(GraphCombOptMDP):
-    # initial state: all nodes = "2" (all nodes are NOT in the set)
-    # 0: chosen to not be in the set
+    # initial state: all nodes = "0" (all nodes are NOT in the set)
+    # 2: chosen to not be in the set
     # 1: chosen to be in the set
-    # 2: undecided, also not in the set
+    # 0: undecided, also not in the set
     def __init__(self, gbatch, cfg):
         super(MaxCutMDP, self).__init__(gbatch, cfg)
         assert not cfg.back_trajectory
@@ -268,7 +308,7 @@ class MaxCutMDP(GraphCombOptMDP):
             self.gbatch.ndata["h"] = ((state == 0) | (state == 2)).float()
             self.gbatch.update_all(fn.copy_u("h", "m"), fn.sum("m", "h"))
             x02_deg = self.gbatch.ndata.pop('h').int()
-        state[undecided & (x1_deg > x02_deg)] = 0
+        state[undecided & (x1_deg > x02_deg)] = 2
         self._state = state
 
         decided_tensor = pad_batch(self.get_decided_mask(state), self.numnode_per_graph, padding_value=True)
@@ -278,12 +318,12 @@ class MaxCutMDP(GraphCombOptMDP):
     def get_log_reward(self, state=None): # calculate the cut
         if state is None:
             state = self._state.clone()
-        state[state == 2] = 0 # "0" for "not in the set"
+        state[state == 0] = 2 # "0" for "not in the set"
         with self.gbatch.local_scope():
             self.gbatch.ndata["h"] = state.float()
             self.gbatch.apply_edges(fn.u_add_v("h", "h", "e"))
-            # 0 + 0 = 0 (not cut), 0 + 1 = 1 (cut), 1 + 1 = 2 (not cut)
-            self.gbatch.edata["e"] = (self.gbatch.edata["e"] == 1).float()
+            # 1 + 1 = 2 (not cut), 2 + 1 = 3 (cut), 2 + 2 = 4 (not cut)
+            self.gbatch.edata["e"] = (self.gbatch.edata["e"] == 3).float()
             cut = dgl.sum_edges(self.gbatch, 'e') # (bs, )
         cut = cut / 2 # each edge is counted twice
         return cut
@@ -291,6 +331,84 @@ class MaxCutMDP(GraphCombOptMDP):
     def batch_metric(self, vec_state):
         return self.get_log_reward(vec_state).tolist()
 
+class ColoringMDP(GraphCombOptMDP):
+    # MDP conditioned on a batch of graphs
+    # state: 0: undecided
+    #color start from 1
+    def __init__(self, gbatch, cfg):
+        assert cfg.task == "Coloring"
+        super(ColoringMDP, self).__init__(gbatch, cfg)
+        self._state = torch.full((gbatch.num_nodes(),), 0, dtype=torch.long, device=self.device)
+        self.num_colors = 0
+
+    # @profile
+    def step(self, action):
+        state = self._state.clone()
+
+        # label the selected node to be "1"
+        action_node_idx = (self.cum_num_node + action)[~self.done]
+        # make sure the idx of action hasn't been decided
+        assert torch.all(~self.get_decided_mask(state[action_node_idx]))
+
+        with self.gbatch.local_scope():
+            self.gbatch.ndata["h"] = state.float()
+            self.gbatch.pull(action_node_idx, fn.copy_u("h", "m"), min_unique(self.device))
+            x_color = self.gbatch.ndata["h"][action_node_idx]  # (#node, # of 1-labeled neighbour node)
+        state[action_node_idx] = x_color.long()
+
+        self._state = state
+
+        decided_tensor = pad_batch(self.get_decided_mask(state), self.numnode_per_graph, padding_value=True)
+        self.done = torch.all(decided_tensor, dim=1)
+        return state
+
+    def get_log_reward(self, state=None):
+        state = pad_batch(self._state, self.numnode_per_graph, padding_value=0)
+        sol = -torch.amax(state, dim=1).float()
+        return sol
+
+    def batch_metric(self, vec_state):
+        return (-self.get_log_reward(vec_state)).tolist()
+    
+class ThreeColoringMDP(GraphCombOptMDP):
+    # MDP conditioned on a batch of graphs
+    # state: 0: undecided
+    #color start from 1
+    def __init__(self, gbatch, cfg):
+        assert cfg.task == "ThreeColoring"
+        super(ThreeColoringMDP, self).__init__(gbatch, cfg)
+        self._state = torch.full((gbatch.num_nodes(),), 0, dtype=torch.long, device=self.device)
+        self.num_colors = 0
+
+    # @profile
+    def step(self, action):
+        state = self._state.clone()
+        action_node_idx = (self.cum_num_node + action)[~self.done]
+        # make sure the idx of action hasn't been decided
+        assert torch.all(~self.get_decided_mask(state[action_node_idx]))
+
+        with self.gbatch.local_scope():
+            self.gbatch.ndata["h"] = state.float()
+            self.gbatch.pull(action_node_idx, fn.copy_u("h", "m"), min_unique_three(self.device))
+            x_color = self.gbatch.ndata["h"][action_node_idx]  # (#node, # of 1-labeled neighbour node)
+        state[action_node_idx] = x_color.long()
+
+        self._state = state
+
+        decided_tensor = pad_batch(self.get_decided_mask(state), self.numnode_per_graph, padding_value=True)
+        self.done = torch.all(decided_tensor, dim=1)
+        return state
+
+    def get_log_reward(self, state=None):
+        state = pad_batch(self._state, self.numnode_per_graph, padding_value=0)
+        sol = torch.amax(state, dim=1)
+        sol[sol > 3] = 100
+        sol = -sol.float()
+        return sol
+
+    def batch_metric(self, vec_state):
+        metric = (-self.get_log_reward(vec_state)).tolist()
+        return metric
 
 ######### Replay Buffer Utils
 

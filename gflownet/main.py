@@ -60,6 +60,12 @@ def refine_cfg(cfg):
         elif cfg.task in ["mcut", "maxcut",]:
             cfg.task = "MaxCut"
             cfg.wandb_project_name = "MaxCut"
+        elif cfg.task in ["color", "coloring", "Coloring"]:
+            cfg.task = "Coloring"
+            cfg.wandb_project_name = "Coloring"
+        elif cfg.task in ["3color", "3coloring", "threecoloring", "ThreeColoring"]:
+            cfg.task = "ThreeColoring"
+            cfg.wandb_project_name = "ThreeColoring"
         else:
             raise NotImplementedError
 
@@ -83,6 +89,8 @@ def refine_cfg(cfg):
         if "rb" in cfg.input:
             cfg.data_type = cfg.input.upper()
         elif "ba" in cfg.input:
+            cfg.data_type = cfg.input.upper()
+        elif "partition" in cfg.input:
             cfg.data_type = cfg.input.upper()
         else:
             raise NotImplementedError
